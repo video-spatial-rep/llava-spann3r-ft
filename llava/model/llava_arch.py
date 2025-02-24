@@ -23,7 +23,9 @@ import torch.nn as nn
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
-
+import deepspeed
+import torch.nn as nn
+import torch.nn.init as init
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -35,15 +37,33 @@ class LlavaMetaModel:
 
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
+        print(f"[DEBUG] LlavaMetaModel config.hidden_size: {getattr(config, 'hidden_size', 'Not set')}")
 
         if hasattr(config, "mm_vision_tower"):
             delay_load = getattr(config, "delay_load", False)
             self.vision_tower = build_vision_tower(config, delay_load=delay_load)
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
+            print(f"[DEBUG] Initializing spanner_projector with config.hidden_size = {config.hidden_size}")
+
+            self.spanner_projector = nn.Sequential(
+                nn.Linear(1152, 768), 
+                nn.GELU(),
+                nn.Linear(768, 768)
+            )
+            # # parameters intializaiton
+            self._initialize_spanner_projector()
+
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+                
+    def _initialize_spanner_projector(self):
+        for module in self.spanner_projector.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=1.0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -51,6 +71,13 @@ class LlavaMetaModel:
             vision_tower = vision_tower[0]
         return vision_tower
 
+
+
+
+
+
+                        
+                        
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
@@ -189,11 +216,17 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.view(num_frames, -1, num_dim)
         return image_feature
 
+    # def encode_images(self, images):
+    #     image_features = self.get_model().get_vision_tower()(images)
+    #     # image_features = self.get_model().vision_resampler(image_features, images=images)
+    #     image_features = self.get_model().mm_projector(image_features)
+    #     return image_features
     def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+        vision_features = self.get_model().get_vision_tower()(images)
         # image_features = self.get_model().vision_resampler(image_features, images=images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
+        image_features = self.get_model().mm_projector(vision_features)
+        return vision_features, image_features
+
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
@@ -276,7 +309,8 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(concat_images)
+            encoded_vision_features, encoded_image_features = self.encode_images(concat_images)
+            vision_features = encoded_vision_features
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
@@ -414,7 +448,8 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            vision_features, image_features = self.encode_images(images)
+
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
@@ -552,7 +587,7 @@ class LlavaMetaForCausalLM(ABC):
             position_ids[:, split_position:] += right_add
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, vision_features
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

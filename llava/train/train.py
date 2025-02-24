@@ -1235,6 +1235,21 @@ class LazySupervisedDataset(Dataset):
             data_dict["prompt"] = prompt
 
         data_dict["id"] = self.list_data_dict[i].get("id", i)
+        
+        # extract feature
+        # sample_id = data_dict["id"]
+        video_file = self.list_data_dict[i]["video"]
+        # feature_file = video_file + ".npy"
+        feature_file = video_file + ".cut3r.npy"
+        # print(f"Going through feature file {video_file}, {feature_file}")
+
+        if os.path.exists(feature_file):
+            np_feature = np.load(feature_file)
+            stored_feature = torch.from_numpy(np_feature).float()  
+            data_dict["stored_feature"] = stored_feature
+        else:
+            data_dict["stored_feature"] = None
+            print(f"Warning: Feature file {feature_file} not found for sample {video_file}")
 
         return data_dict
 
@@ -1282,6 +1297,10 @@ class DataCollatorForSupervisedDataset(object):
 
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
+            
+        if "stored_feature" in instances[0]:
+            stored_features = [instance["stored_feature"] for instance in instances]
+            batch["stored_features"] = torch.stack(stored_features, dim=0)
 
         return batch
 
